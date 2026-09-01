@@ -39,7 +39,6 @@ from supernote.models.file_web import (
 )
 from supernote.server.constants import (
     CATEGORY_CONTAINERS,
-    IMMUTABLE_SYSTEM_DIRECTORIES,
     ORDERED_WEB_ROOT,
 )
 from supernote.server.exceptions import SupernoteError
@@ -449,8 +448,13 @@ async def handle_folder_list_query(request: web.Request) -> web.Response:
                         child.entity.parent_id = 0  # View adjustment
                         folder_details.append(child)
                 else:
-                    if detail.entity.name not in IMMUTABLE_SYSTEM_DIRECTORIES:
-                        detail.entity.name = detail.entity.name.capitalize()
+                    # Shown as it is stored. This used to capitalize anything
+                    # not in the immutable set, to paper over the root holding
+                    # both EXPORT and Export - which is now prevented at
+                    # creation instead. Rewriting the name here also renamed
+                    # the user's own root folders in the display only, so
+                    # `myProject` was listed as `Myproject` and every rename
+                    # dialog opened on a name the device had never heard of.
                     folder_details.append(detail)
 
         folder_details.sort(key=_root_sort_key)

@@ -5,7 +5,9 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from supernote.server.constants import (
+    CASE_VARIANT_SYSTEM_ROOTS,
     SYSTEM_CATEGORY_CONTAINER_MAP,
+    SYSTEM_ROOT_DIRECTORIES,
 )
 from supernote.server.db.models.file import RecycleFileDO, UserFileDO
 from supernote.server.exceptions import FileAlreadyExists, InvalidPath
@@ -27,6 +29,11 @@ class VirtualFileSystem:
         Checks direct children at root (directory_id=0) first. If not found and the segment
         matches a known category subfolder (Note, MyStyle, Document), checks inside its
         explicit parent container (NOTE or DOCUMENT).
+
+        The three root folders the firmware respells resolve without regard to
+        case, exactly as they are created. The two have to agree: a device that
+        writes to `EXPORT/` and is then told `EXPORT/` does not exist has been
+        handed a filesystem that forgets what it just stored.
         """
         stmt = select(UserFileDO).where(
             UserFileDO.user_id == user_id,
@@ -38,6 +45,11 @@ class VirtualFileSystem:
         if node := result.scalar_one_or_none():
             return node
 
+        if node := await self._existing_system_directory(user_id, 0, segment):
+            return node
+
+        # Exact, deliberately: `Note` here must not resolve to the `NOTE` that
+        # contains it.
         if target_container := SYSTEM_CATEGORY_CONTAINER_MAP.get(segment):
             category_parent = (
                 select(UserFileDO.id)
@@ -61,6 +73,71 @@ class VirtualFileSystem:
 
         return None
 
+    async def _existing_system_directory(
+        self, user_id: int, parent_id: int, name: str
+    ) -> UserFileDO | None:
+        """The system directory `name` already names, differing only by case.
+
+        Only the three root folders the firmware spells differently are matched
+        this way. Two user folders called `Work` and `work` are two folders and
+        that stays true, and so do `NOTE` and `Note`; but `EXPORT` and `Export`
+        at the root are one place, and creating the second leaves a root the
+        firmware does not recognise holding a duplicate nobody may remove.
+        """
+        if parent_id != 0:
+            return None
+
+        folded = name.casefold()
+        if not any(d.casefold() == folded for d in CASE_VARIANT_SYSTEM_ROOTS):
+            return None
+
+        stmt = select(UserFileDO).where(
+            UserFileDO.user_id == user_id,
+            UserFileDO.directory_id == parent_id,
+            func.lower(UserFileDO.file_name) == folded,
+            UserFileDO.is_active == "Y",
+            UserFileDO.is_folder == "Y",
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
+
+    async def is_system_directory(self, user_id: int, node: UserFileDO) -> bool:
+        """Whether `node` is a system directory *in its system location*.
+
+        The firmware's contract is about places, not spellings: it expects to
+        find Export, Inbox and Screenshot at the root, and Note, MyStyle and
+        Document inside their category containers. Those are the nodes that
+        cannot be deleted or renamed.
+
+        Anything else with one of those names is an ordinary folder. Answering
+        this by name alone made every folder called `Document` undeletable no
+        matter how deep in the user's own tree it sat, which is a rule nobody
+        asked for and one the error message could not explain.
+        """
+        if node.is_folder != "Y":
+            return False
+
+        name = node.file_name
+        if node.directory_id == 0:
+            # Case-insensitively for the three the firmware respells, exactly
+            # for the containers, so a root folder called `note` is the user's
+            # and not mistaken for the `NOTE` container.
+            folded = name.casefold()
+            return name in SYSTEM_ROOT_DIRECTORIES or any(
+                d.casefold() == folded for d in CASE_VARIANT_SYSTEM_ROOTS
+            )
+
+        container = SYSTEM_CATEGORY_CONTAINER_MAP.get(name)
+        if container is None:
+            return False
+
+        parent_node = await self.get_node_by_id(user_id, node.directory_id)
+        return (
+            parent_node is not None
+            and parent_node.directory_id == 0
+            and parent_node.file_name == container
+        )
+
     async def create_directory(
         self, user_id: int, parent_id: int, name: str
     ) -> UserFileDO:
@@ -75,6 +152,10 @@ class VirtualFileSystem:
         )
         result = await self.db.execute(stmt)
         existing = result.scalar_one_or_none()
+
+        if existing is None:
+            existing = await self._existing_system_directory(user_id, parent_id, name)
+
         if existing:
             # TODO: Determine what the API semantic are and if we should
             # raise an error or not. This requires auditing the client code
