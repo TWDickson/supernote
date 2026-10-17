@@ -77,17 +77,3 @@ async def test_a_users_own_folder_may_share_a_system_name(
 
     children = await web_client.list_query(directory_id=int(note_folder.id))
     assert not any(f.file_name == "Document" for f in children.user_file_vo_list)
-
-
-async def test_a_folder_differing_only_by_case_is_not_a_second_folder(
-    device_client: DeviceClient,
-) -> None:
-    """Creating `EXPORT` when `Export` exists does not add a second folder."""
-    before = await device_client.list_folder("/", recursive=False)
-    assert any(e.name == "Export" for e in before.entries)
-
-    await device_client.create_folder(path="/EXPORT", equipment_no="TEST")
-
-    after = await device_client.list_folder("/", recursive=False)
-    exports = [e for e in after.entries if e.name.lower() == "export"]
-    assert len(exports) == 1, [e.name for e in exports]

@@ -2,18 +2,13 @@
 
 # Folders a Supernote device expects at fixed locations. Whether a folder is a
 # system folder depends on where it is, see `VirtualFileSystem.is_system_directory`.
-#
-# The firmware creates these three root folders in capitals (EXPORT, INBOX,
-# SCREENSHOT), so they are matched ignoring case.
-CASE_VARIANT_SYSTEM_ROOTS = {
+SYSTEM_ROOT_DIRECTORIES = {
     "Export",
     "Inbox",
     "Screenshot",
+    "NOTE",
+    "DOCUMENT",
 }
-
-# `NOTE` and `DOCUMENT` are matched exactly: `Note` is a different folder inside
-# `NOTE`.
-SYSTEM_ROOT_DIRECTORIES = CASE_VARIANT_SYSTEM_ROOTS | {"NOTE", "DOCUMENT"}
 
 # All system folder names regardless of location. Not suitable for deciding
 # whether a folder is protected; use `VirtualFileSystem.is_system_directory`.
