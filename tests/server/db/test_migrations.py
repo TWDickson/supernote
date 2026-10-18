@@ -222,14 +222,13 @@ def test_mixed_case_system_roots_are_merged(
         )
 
     with engine.begin() as conn:
-        roots = dict(
-            conn.execute(
-                text(
-                    "SELECT file_name, id FROM f_user_file "
-                    "WHERE user_id = 1 AND directory_id = 0"
-                )
-            ).fetchall()
-        )
+        rows = conn.execute(
+            text(
+                "SELECT file_name, id FROM f_user_file "
+                "WHERE user_id = 1 AND directory_id = 0"
+            )
+        ).fetchall()
+        roots = {name: id for name, id in rows}
         export = roots["Export"]
         add(9000, 0, "EXPORT", folder=True)
         add(9001, export, "only-old.pdf", md5="a")
@@ -241,6 +240,8 @@ def test_mixed_case_system_roots_are_merged(
         add(9007, 9006, "x.txt", md5="e")
         add(9008, 9000, "Sub", folder=True)
         add(9009, 9008, "y.txt", md5="f")
+        add(9010, 9000, "clash (1).pdf", md5="g")
+        add(9011, export, "Sub", md5="h")
 
     command.upgrade(alembic_config, "head")
 
@@ -262,13 +263,27 @@ def test_mixed_case_system_roots_are_merged(
         assert root["INBOX"][0] == roots["Inbox"]
         assert root["EXPORT"][0] == 9000
 
-        assert active(9000) == {
+        files = {k: v for k, v in active(9000).items() if k != "Sub"}
+        assert files == {
             "only-old.pdf": (9001, "a"),
             "same.pdf": (9003, "b"),
             "clash.pdf": (9005, "d"),
-            "clash (1).pdf": (9004, "c"),
-            "Sub": (9008, None),
+            "clash (1).pdf": (9010, "g"),
+            "clash (2).pdf": (9004, "c"),
         }
+        # A file and a folder may share a name, so neither is renamed.
+        subs = conn.execute(
+            text(
+                "SELECT id, is_folder FROM f_user_file WHERE directory_id = 9000 "
+                "AND file_name = 'Sub' AND is_active = 'Y' ORDER BY id"
+            )
+        ).fetchall()
+        assert [tuple(r) for r in subs] == [(9008, "Y"), (9011, "N")]
         assert set(active(9008)) == {"x.txt", "y.txt"}
+
+    # Merged folders cannot be split again, so a downgrade leaves them as they are.
+    command.downgrade(alembic_config, "68964804740d")
+    with engine.connect() as conn:
+        assert set(active(0)) == {"DOCUMENT", "EXPORT", "INBOX", "NOTE", "SCREENSHOT"}
 
     engine.dispose()
