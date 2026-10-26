@@ -9,7 +9,11 @@ from supernote.client.exceptions import ApiException
 from supernote.client.extended import ExtendedClient
 from supernote.client.summary import SummaryClient
 from supernote.models.base import ProcessingStatus
-from supernote.models.extended import PageTranscriptVO
+from supernote.models.extended import (
+    PageTranscriptVO,
+    VocabularySource,
+    VocabularyTermVO,
+)
 from supernote.models.summary import AddSummaryDTO
 from supernote.server.config import AiConfig, ModelConfig, ServerConfig
 from supernote.server.db.models.file import UserFileDO
@@ -453,3 +457,39 @@ async def test_extended_ai_status(extended_client: ExtendedClient) -> None:
         "vectorSearchEnabled": True,
         "model": "fake-ocr-v1",
     }
+
+
+async def test_vocabulary_add_list_delete(
+    extended_client: ExtendedClient,
+) -> None:
+    added = await extended_client.add_vocabulary(["Lovelace", "Babbage"])
+    assert [(t.term, t.scope_id, t.source) for t in added.terms] == [
+        ("Lovelace", 0, VocabularySource.MANUAL),
+        ("Babbage", 0, VocabularySource.MANUAL),
+    ]
+
+    listed = await extended_client.list_vocabulary()
+    assert listed.terms == added.terms
+
+    await extended_client.delete_vocabulary(added.terms[0].id)
+    listed = await extended_client.list_vocabulary()
+    assert listed.terms == [
+        VocabularyTermVO(
+            id=added.terms[1].id,
+            term="Babbage",
+            scope_id=0,
+            source=VocabularySource.MANUAL,
+        )
+    ]
+
+
+async def test_vocabulary_errors(extended_client: ExtendedClient) -> None:
+    with pytest.raises(ApiException, match="404"):
+        await extended_client.delete_vocabulary(12345)
+    with pytest.raises(ApiException, match="404"):
+        await extended_client.add_vocabulary(["Lovelace"], scope_id=12345)
+    with pytest.raises(ApiException, match="400"):
+        await extended_client.add_vocabulary([""])
+    for path in ("/api/extended/vocabulary/add", "/api/extended/vocabulary/delete"):
+        with pytest.raises(ApiException, match="400"):
+            await extended_client._client.post(path, json={})

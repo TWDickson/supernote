@@ -265,6 +265,23 @@ The server dynamically routes prompts based on the notebook's file name:
 3.  If found, the templates inside that custom folder are loaded. If not found, it falls back to the `default/` templates.
 4.  Templates found in the `common/` folder are always concatenated first.
 
+### 4. Vocabulary
+OCR prompts also list the names and terms a person uses, so that a handwritten
+word that closely matches one is spelled the way they spell it. The model is
+told never to insert a listed term the handwriting does not support.
+
+*   **Harvested automatically**: keywords added to a notebook on the device are
+    added for the folder that notebook is in. Common words are skipped.
+*   **Added by hand**: `POST /api/extended/vocabulary/add` with
+    `{"terms": [...], "scopeId": 0}`. `scopeId` is a folder or notebook ID, or
+    `0` for every notebook.
+*   **Removed**: `POST /api/extended/vocabulary/delete` with `{"id": ...}`. A
+    removed harvested term is not harvested again.
+*   **Listed**: `POST /api/extended/vocabulary/list`.
+
+A notebook's prompt uses the terms scoped to it, to each folder above it, and to
+every notebook, nearest first, up to 200 terms.
+
 ## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](docs/CONTRIBUTING.md) for details on:

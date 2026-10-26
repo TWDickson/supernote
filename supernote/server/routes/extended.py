@@ -11,7 +11,7 @@ from aiohttp import web
 from mashumaro.exceptions import InvalidFieldValue, MissingField
 from sqlalchemy import select
 
-from supernote.models.base import ProcessingStatus
+from supernote.models.base import BaseResponse, ProcessingStatus
 from supernote.models.extended import (
     FileProcessingStatusDTO,
     FileProcessingStatusVO,
@@ -19,6 +19,10 @@ from supernote.models.extended import (
     SearchResultVO,
     SystemTaskListVO,
     SystemTaskVO,
+    VocabularyAddDTO,
+    VocabularyDeleteDTO,
+    VocabularyListVO,
+    VocabularyTermVO,
     WebSearchRequestDTO,
     WebSearchResponseVO,
     WebSummaryListRequestDTO,
@@ -36,6 +40,7 @@ from supernote.server.exceptions import SupernoteError
 from supernote.server.services.search import SearchService
 from supernote.server.services.summary import SummaryService
 from supernote.server.services.user import UserService
+from supernote.server.services.vocabulary import VocabularyService, VocabularyTerm
 
 logger = logging.getLogger(__name__)
 
@@ -303,3 +308,76 @@ async def handle_extended_ai_status(request: web.Request) -> web.Response:
             "model": model,
         }
     )
+
+
+_INVALID_REQUEST_ERRORS = (
+    json.JSONDecodeError,
+    ValueError,
+    TypeError,
+    KeyError,
+    MissingField,
+    InvalidFieldValue,
+)
+
+
+def _term_vo(term: VocabularyTerm) -> VocabularyTermVO:
+    return VocabularyTermVO(
+        id=term.id, term=term.term, scope_id=term.scope_id, source=term.source
+    )
+
+
+@routes.post("/api/extended/vocabulary/list")
+async def handle_vocabulary_list(request: web.Request) -> web.Response:
+    # Endpoint: POST /api/extended/vocabulary/list
+    # Purpose: List the terms transcription prompts prefer for this user.
+    user_service: UserService = request.app["user_service"]
+    vocabulary_service: VocabularyService = request.app["vocabulary_service"]
+    user_id = await user_service.get_user_id(request["user"])
+    terms = await vocabulary_service.list_terms(user_id)
+    return web.json_response(
+        VocabularyListVO(terms=[_term_vo(t) for t in terms]).to_dict()
+    )
+
+
+@routes.post("/api/extended/vocabulary/add")
+async def handle_vocabulary_add(request: web.Request) -> web.Response:
+    # Endpoint: POST /api/extended/vocabulary/add
+    # Purpose: Add terms for every notebook, or for one folder or notebook.
+    try:
+        req_dto = VocabularyAddDTO.from_dict(await request.json())
+    except _INVALID_REQUEST_ERRORS as e:
+        return web.json_response({"error": f"Invalid Request: {e}"}, status=400)
+
+    user_service: UserService = request.app["user_service"]
+    vocabulary_service: VocabularyService = request.app["vocabulary_service"]
+    user_id = await user_service.get_user_id(request["user"])
+    try:
+        terms = await vocabulary_service.add_terms(
+            user_id, req_dto.terms, scope_id=req_dto.scope_id
+        )
+    except SupernoteError as err:
+        return err.to_response()
+    except ValueError as e:
+        return web.json_response({"error": f"Invalid Request: {e}"}, status=400)
+    return web.json_response(
+        VocabularyListVO(terms=[_term_vo(t) for t in terms]).to_dict()
+    )
+
+
+@routes.post("/api/extended/vocabulary/delete")
+async def handle_vocabulary_delete(request: web.Request) -> web.Response:
+    # Endpoint: POST /api/extended/vocabulary/delete
+    # Purpose: Remove a term. A harvested term stays removed on later harvests.
+    try:
+        req_dto = VocabularyDeleteDTO.from_dict(await request.json())
+    except _INVALID_REQUEST_ERRORS as e:
+        return web.json_response({"error": f"Invalid Request: {e}"}, status=400)
+
+    user_service: UserService = request.app["user_service"]
+    vocabulary_service: VocabularyService = request.app["vocabulary_service"]
+    user_id = await user_service.get_user_id(request["user"])
+    try:
+        await vocabulary_service.remove_term(user_id, req_dto.id)
+    except SupernoteError as err:
+        return err.to_response()
+    return web.json_response(BaseResponse().to_dict())

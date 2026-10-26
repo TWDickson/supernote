@@ -1,9 +1,13 @@
 """Client for Extended (Web) APIs."""
 
+from supernote.models.base import BaseResponse
 from supernote.models.extended import (
     FileProcessingStatusDTO,
     FileProcessingStatusVO,
     SystemTaskListVO,
+    VocabularyAddDTO,
+    VocabularyDeleteDTO,
+    VocabularyListVO,
     WebSearchRequestDTO,
     WebSearchResponseVO,
     WebSummaryListRequestDTO,
@@ -80,4 +84,26 @@ class ExtendedClient:
         """List recent system tasks (Extension)."""
         return await self._client.get_json(
             "/api/extended/system/tasks", SystemTaskListVO
+        )
+
+    async def list_vocabulary(self) -> VocabularyListVO:
+        """List vocabulary terms used in transcription prompts (Extension)."""
+        return await self._client.post_json(
+            "/api/extended/vocabulary/list", VocabularyListVO, json={}
+        )
+
+    async def add_vocabulary(
+        self, terms: list[str], scope_id: int = 0
+    ) -> VocabularyListVO:
+        """Add vocabulary terms for every notebook, or one folder or notebook (Extension)."""
+        dto = VocabularyAddDTO(terms=terms, scope_id=scope_id)
+        return await self._client.post_json(
+            "/api/extended/vocabulary/add", VocabularyListVO, json=dto.to_dict()
+        )
+
+    async def delete_vocabulary(self, term_id: int) -> BaseResponse:
+        """Remove a vocabulary term (Extension)."""
+        dto = VocabularyDeleteDTO(id=term_id)
+        return await self._client.post_json(
+            "/api/extended/vocabulary/delete", BaseResponse, json=dto.to_dict()
         )
