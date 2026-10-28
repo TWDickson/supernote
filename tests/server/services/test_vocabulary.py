@@ -6,6 +6,7 @@ from supernote.models.extended import VocabularySource
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.vocabulary import ROOT_SCOPE_ID
 from supernote.server.db.session import DatabaseSessionManager
+from supernote.server.events import NoteDeletedEvent, NoteUpdatedEvent
 from supernote.server.exceptions import FileNotFound, VocabularyTermNotFound
 from supernote.server.services.vocabulary import (
     MAX_PROMPT_TERMS,
@@ -180,6 +181,95 @@ async def test_harvest_ignores_files_of_other_users(
         await vocabulary_service.harvest(OTHER_USER_ID, NOTEBOOK_ID, ["Kestrel"]) == 0
     )
     assert await vocabulary_service.harvest(USER_ID, 99999, ["Kestrel"]) == 0
+
+
+async def test_harvest_follows_keyword_removals_and_edits(
+    vocabulary_service: VocabularyService,
+) -> None:
+    await vocabulary_service.add_terms(USER_ID, ["Osprey"], scope_id=WORK_FOLDER_ID)
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrl", "Heron", "Owl"])
+    [owl] = [t for t in await vocabulary_service.list_terms(USER_ID) if t.term == "Owl"]
+    await vocabulary_service.remove_term(USER_ID, owl.id)
+
+    # A spelling fix on the device replaces the misspelling; a dropped keyword goes
+    assert await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel"]) == 1
+    assert [
+        (t.term, t.source, t.is_suppressed)
+        for t in await vocabulary_service.list_terms(USER_ID, include_suppressed=True)
+    ] == [
+        ("Osprey", VocabularySource.MANUAL, False),
+        ("Owl", VocabularySource.HARVEST, True),
+        ("Kestrel", VocabularySource.HARVEST, False),
+    ]
+
+
+async def test_harvest_keeps_terms_the_user_took_over(
+    vocabulary_service: VocabularyService,
+) -> None:
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel"])
+    [term] = await vocabulary_service.list_terms(USER_ID)
+    await vocabulary_service.move_term(USER_ID, term.id, ROOT_SCOPE_ID)
+
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, [])
+    assert [t.term for t in await vocabulary_service.list_terms(USER_ID)] == ["Kestrel"]
+
+
+async def test_harvest_follows_a_moved_notebook(
+    vocabulary_service: VocabularyService, session_manager: DatabaseSessionManager
+) -> None:
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel"])
+    async with session_manager.session() as session:
+        note = await session.get(UserFileDO, NOTEBOOK_ID)
+        assert note
+        note.directory_id = NOTE_FOLDER_ID
+        await session.commit()
+
+    assert await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel"]) == 1
+    assert [
+        (t.term, t.scope_id) for t in await vocabulary_service.list_terms(USER_ID)
+    ] == [("Kestrel", NOTE_FOLDER_ID)]
+
+
+async def test_harvest_shared_keyword_moves_to_remaining_notebook(
+    vocabulary_service: VocabularyService,
+) -> None:
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel"])
+    assert await vocabulary_service.harvest(USER_ID, SIBLING_ID, ["Kestrel"]) == 0
+
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, [])
+    assert await vocabulary_service.list_terms(USER_ID) == []
+    assert await vocabulary_service.harvest(USER_ID, SIBLING_ID, ["Kestrel"]) == 1
+    assert [t.origin_file_id for t in await vocabulary_service.list_terms(USER_ID)] == [
+        SIBLING_ID
+    ]
+
+
+async def test_deleted_notebook_takes_its_terms(
+    vocabulary_service: VocabularyService,
+) -> None:
+    await vocabulary_service.add_terms(USER_ID, ["Lovelace"], scope_id=WORK_FOLDER_ID)
+    await vocabulary_service.harvest(USER_ID, NOTEBOOK_ID, ["Kestrel", "Heron"])
+    await vocabulary_service.harvest(USER_ID, SIBLING_ID, ["Osprey"])
+    [heron] = [
+        t for t in await vocabulary_service.list_terms(USER_ID) if t.term == "Heron"
+    ]
+    await vocabulary_service.remove_term(USER_ID, heron.id)
+
+    await vocabulary_service.handle_note_deleted(
+        NoteUpdatedEvent(file_id=NOTEBOOK_ID, user_id=USER_ID, file_path="Plan.note")
+    )
+    await vocabulary_service.handle_note_deleted(
+        NoteDeletedEvent(file_id=NOTEBOOK_ID, user_id=OTHER_USER_ID)
+    )
+    assert len(await vocabulary_service.list_terms(USER_ID)) == 3
+
+    await vocabulary_service.handle_note_deleted(
+        NoteDeletedEvent(file_id=NOTEBOOK_ID, user_id=USER_ID)
+    )
+    assert [
+        (t.term, t.is_suppressed)
+        for t in await vocabulary_service.list_terms(USER_ID, include_suppressed=True)
+    ] == [("Lovelace", False), ("Heron", True), ("Osprey", False)]
 
 
 async def test_removed_harvest_term_stays_removed(

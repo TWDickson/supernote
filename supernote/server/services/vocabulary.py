@@ -4,7 +4,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from supernote.models.extended import VocabularySource
@@ -12,6 +12,7 @@ from supernote.server.constants import CATEGORY_CONTAINERS
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.vocabulary import ROOT_SCOPE_ID, VocabularyTermDO
 from supernote.server.db.session import DatabaseSessionManager
+from supernote.server.events import Event, NoteDeletedEvent
 from supernote.server.exceptions import FileNotFound, VocabularyTermNotFound
 from supernote.server.services.vfs import VirtualFileSystem
 from supernote.server.utils.common_words import is_common
@@ -84,8 +85,10 @@ class VocabularyService:
 
     A term applies to a notebook when its scope is the notebook, any folder
     above it, or `ROOT_SCOPE_ID`. Harvested terms come from the keywords a
-    person typed on the device; removing one suppresses it rather than
-    deleting it, so the next harvest does not add it back.
+    person typed on the device and follow them: a keyword removed or edited
+    on the device, or a notebook deleted, takes its terms with it. Removing a
+    harvested term here suppresses it rather than deleting it, so the next
+    harvest does not add it back.
     """
 
     def __init__(self, session_manager: DatabaseSessionManager) -> None:
@@ -223,7 +226,7 @@ class VocabularyService:
             return (await self._describe(session, user_id, [row]))[0]
 
     async def harvest(self, user_id: int, file_id: int, keywords: Iterable[str]) -> int:
-        """Add a notebook's device keywords for the folder tree it belongs to.
+        """Sync a notebook's device keywords into the folder tree it belongs to.
 
         The scope is the highest folder above the notebook that is not a
         device system folder, so notebooks in `Work/` and `Work/Weeks/` share
@@ -231,14 +234,31 @@ class VocabularyService:
         folder. Keywords that would not help OCR, and terms already present
         (or suppressed) in that scope or for every notebook, are skipped.
 
+        Terms first harvested from this notebook that are no longer among its
+        keywords, or that belong to the scope of a folder it has left, are
+        deleted. Terms the user removed, moved, or added by hand are kept.
+
         Returns:
             The number of terms added.
         """
+        current: dict[str, str] = {}
+        for keyword in keywords:
+            if (term := _clean_keyword(keyword)) is not None:
+                current.setdefault(term.casefold(), term)
+
         async with self.session_manager.session() as session:
             note = await session.get(UserFileDO, file_id)
             if not note or note.user_id != user_id:
                 return 0
             scope_id = await self._harvest_scope(session, user_id, note)
+            stale = [
+                row
+                for row in await self._harvested_from(session, user_id, file_id)
+                if row.scope_id != scope_id or row.term.casefold() not in current
+            ]
+            for row in stale:
+                await session.delete(row)
+            await session.flush()
             known = {
                 term.casefold()
                 for term in (
@@ -251,11 +271,9 @@ class VocabularyService:
                 ).scalars()
             }
             added = 0
-            for keyword in keywords:
-                term = _clean_keyword(keyword)
-                if term is None or term.casefold() in known:
+            for folded, term in current.items():
+                if folded in known:
                     continue
-                known.add(term.casefold())
                 session.add(
                     VocabularyTermDO(
                         user_id=user_id,
@@ -269,7 +287,26 @@ class VocabularyService:
             await session.commit()
         if added:
             logger.info(f"Harvested {added} vocabulary term(s) from file {file_id}")
+        if stale:
+            logger.info(
+                f"Dropped {len(stale)} vocabulary term(s) no longer in file {file_id}"
+            )
         return added
+
+    async def handle_note_deleted(self, event: Event) -> None:
+        """Delete the terms harvested from a notebook that was purged."""
+        if not isinstance(event, NoteDeletedEvent):
+            return
+        async with self.session_manager.session() as session:
+            await session.execute(
+                delete(VocabularyTermDO).where(
+                    VocabularyTermDO.user_id == event.user_id,
+                    VocabularyTermDO.origin_file_id == event.file_id,
+                    VocabularyTermDO.source == VocabularySource.HARVEST.value,
+                    VocabularyTermDO.is_suppressed.is_(False),
+                )
+            )
+            await session.commit()
 
     async def terms_for_notebook(self, user_id: int, file_id: int) -> list[str]:
         """Return the terms that apply to a notebook, nearest scope first.
@@ -334,6 +371,22 @@ class VocabularyService:
         scope = await session.get(UserFileDO, scope_id)
         if not scope or scope.user_id != user_id or scope.is_active != "Y":
             raise FileNotFound(f"Vocabulary scope {scope_id} not found")
+
+    @staticmethod
+    async def _harvested_from(
+        session: AsyncSession, user_id: int, file_id: int
+    ) -> list[VocabularyTermDO]:
+        rows = (
+            await session.execute(
+                select(VocabularyTermDO).where(
+                    VocabularyTermDO.user_id == user_id,
+                    VocabularyTermDO.origin_file_id == file_id,
+                    VocabularyTermDO.source == VocabularySource.HARVEST.value,
+                    VocabularyTermDO.is_suppressed.is_(False),
+                )
+            )
+        ).scalars()
+        return list(rows)
 
     @staticmethod
     async def _terms_in_scope(

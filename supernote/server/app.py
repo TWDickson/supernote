@@ -22,7 +22,7 @@ from .ai.models.summary import create_summary_model
 from .config import AuthConfig, ServerConfig
 from .constants import MAX_UPLOAD_SIZE
 from .db.session import DatabaseSessionManager
-from .events import LocalEventBus
+from .events import LocalEventBus, NoteDeletedEvent
 from .metrics import HTTP_REQUEST_DURATION_SECONDS, HTTP_REQUESTS_TOTAL
 from .routes import (
     admin,
@@ -264,6 +264,7 @@ def create_app(config: ServerConfig) -> web.Application:
     )
     vocabulary_service = VocabularyService(session_manager)
     app["vocabulary_service"] = vocabulary_service
+    event_bus.subscribe(NoteDeletedEvent, vocabulary_service.handle_note_deleted)
     processor_service.register_modules(
         hashing=PageHashingModule(file_service=file_service),
         vocabulary=VocabularyHarvestModule(
