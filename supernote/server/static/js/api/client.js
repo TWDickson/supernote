@@ -402,6 +402,10 @@ export async function searchFiles(keyword) {
         body: JSON.stringify({ keyword })
     });
 
+    if (response.status === 401) {
+        logout();
+        throw new Error("Unauthorized");
+    }
     if (!response.ok) return [];
     const data = await response.json();
     return data.entries || [];
@@ -420,16 +424,20 @@ export async function searchSemantic(query, topN = 5) {
             'Content-Type': 'application/json',
             'x-access-token': currentToken
         },
-        body: JSON.stringify({ query, top_n: topN })
+        body: JSON.stringify({ query, topN })
     });
 
+    if (response.status === 401) {
+        logout();
+        throw new Error("Unauthorized");
+    }
     if (!response.ok) return [];
     const data = await response.json();
     return data.results || [];
 }
 
 /**
- * Fetch AI Processing Status & Gemini API Key health.
+ * Fetch server AI processing configuration status.
  */
 export async function fetchAiStatus() {
     const currentToken = getToken();
@@ -441,8 +449,12 @@ export async function fetchAiStatus() {
         headers
     });
 
+    if (response.status === 401) {
+        logout();
+        throw new Error("Unauthorized");
+    }
     if (!response.ok) {
-        return { hasApiKey: false, ocrEnabled: false, vectorSearchEnabled: false, model: 'N/A' };
+        return { hasApiKey: false, ocrEnabled: false, vectorSearchEnabled: false, model: null };
     }
     return await response.json();
 }
@@ -791,4 +803,31 @@ export async function downloadFile(fileId) {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+}
+
+/**
+ * Fetch a lightweight single-page cover preview URL (page 0) for a notebook.
+ * @param {string|number} fileId
+ * @returns {Promise<string|null>}
+ */
+export async function fetchNoteCover(fileId) {
+    const currentToken = getToken();
+    if (!currentToken) throw new Error("Unauthorized");
+
+    const response = await fetch('/api/extended/file/note/cover', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'x-access-token': currentToken
+        },
+        body: JSON.stringify({ fileId: String(fileId) })
+    });
+
+    if (response.status === 401) {
+        logout();
+        throw new Error("Unauthorized");
+    }
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.url || null;
 }

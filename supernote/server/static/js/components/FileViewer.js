@@ -1,5 +1,5 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
-import { convertNoteToPng, fetchTranscript, fetchSummaries, fetchDownloadUrl, downloadFile } from '../api/client.js';
+import { convertNoteToPng, fetchTranscript, fetchSummaries, fetchAiStatus, fetchDownloadUrl, downloadFile } from '../api/client.js';
 import { showToast } from '../composables/useToast.js';
 
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg']);
@@ -8,7 +8,7 @@ const MAX_TEXT_PREVIEW_BYTES = 2 * 1024 * 1024; // 2 MB
 
 export default {
     name: 'FileViewer',
-    props: ['file'],
+    props: ['file', 'initialPage', 'pageJumpSeq'],
     emits: ['close'],
     setup(props) {
         const pages = ref([]);
@@ -24,6 +24,7 @@ export default {
         const transcriptPages = ref([]);
         const activePageIndex = ref(0);
         const realSummaries = ref([]);
+        const aiStatus = ref(null);
         const isLoadingTranscript = ref(false);
 
         const leftScrollPane = ref(null);
@@ -31,6 +32,8 @@ export default {
         let pageObserver = null;
         let isProgrammaticScroll = false;
         let programmaticScrollTimer = null;
+        let pendingTargetPage = null;
+        let pendingTargetTimer = null;
         let activeLoadSeq = 0;
 
         const fileExt = computed(() => {
@@ -71,6 +74,23 @@ export default {
             }));
         };
 
+        const clearPendingTargetPage = () => {
+            pendingTargetPage = null;
+            if (pendingTargetTimer) {
+                clearTimeout(pendingTargetTimer);
+                pendingTargetTimer = null;
+            }
+        };
+
+        const armPendingTargetPage = (pageIndex) => {
+            clearPendingTargetPage();
+            pendingTargetPage = pageIndex;
+            pendingTargetTimer = setTimeout(() => {
+                pendingTargetPage = null;
+                pendingTargetTimer = null;
+            }, 2000);
+        };
+
         const armProgrammaticScrollRelease = () => {
             if (programmaticScrollTimer) clearTimeout(programmaticScrollTimer);
             programmaticScrollTimer = setTimeout(() => {
@@ -79,7 +99,8 @@ export default {
             }, 180);
         };
 
-        const scrollTranscriptToPage = (pageIndex) => {
+        const scrollTranscriptToPage = (pageIndex, options = {}) => {
+            const behavior = options.behavior || 'smooth';
             const pane = transcriptScrollPane.value;
             if (!pane) return;
             const cardEl = pane.querySelector(`[data-transcript-page="${pageIndex}"]`);
@@ -90,14 +111,18 @@ export default {
                 const cardRect = cardEl.getBoundingClientRect();
                 if (cardRect.top < paneRect.top + 8 || cardRect.bottom > paneRect.bottom - 8) {
                     const targetTop = pane.scrollTop + (cardRect.top - paneRect.top) - 16;
-                    pane.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+                    pane.scrollTo({ top: Math.max(0, targetTop), behavior });
                 }
             } else if (typeof cardEl.scrollIntoView === 'function') {
-                cardEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                cardEl.scrollIntoView({ behavior, block: 'nearest' });
             }
         };
 
-        const scrollToCanvasPage = (pageIndex) => {
+        const scrollToCanvasPage = (pageIndex, options = {}) => {
+            const behavior = options.behavior || 'smooth';
+            if (!options.keepAnchor) {
+                armPendingTargetPage(pageIndex);
+            }
             activePageIndex.value = pageIndex;
             const pane = leftScrollPane.value;
             if (!pane) return;
@@ -111,15 +136,38 @@ export default {
                 const paneRect = pane.getBoundingClientRect();
                 const elRect = pageEl.getBoundingClientRect();
                 const targetTop = pane.scrollTop + (elRect.top - paneRect.top) - 16;
-                pane.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+                pane.scrollTo({ top: Math.max(0, targetTop), behavior });
             } else if (typeof pageEl.scrollIntoView === 'function') {
-                pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                pageEl.scrollIntoView({ behavior, block: 'start' });
             }
         };
 
-        const updateActivePageFromScroll = () => {
-            if (isProgrammaticScroll) {
-                armProgrammaticScrollRelease();
+        const jumpToTargetPage = async (rawPageIndex, { smooth = false } = {}) => {
+            if (typeof rawPageIndex !== 'number' || Number.isNaN(rawPageIndex) || rawPageIndex < 0) {
+                return;
+            }
+            const maxPageIdx = pages.value.length > 0
+                ? pages.value.length - 1
+                : (transcriptPages.value.length > 0 ? transcriptPages.value.length - 1 : rawPageIndex);
+            const targetIdx = Math.max(0, Math.min(rawPageIndex, maxPageIdx));
+            const behavior = smooth ? 'smooth' : 'auto';
+
+            activePageIndex.value = targetIdx;
+            await nextTick();
+            if (pages.value.length > 0) {
+                scrollToCanvasPage(targetIdx, { behavior });
+            }
+            scrollTranscriptToPage(targetIdx, { behavior });
+        };
+
+        const updateActivePageFromScroll = (event) => {
+            if (event?.type === 'load' && pendingTargetPage !== null) {
+                scrollToCanvasPage(pendingTargetPage, { behavior: 'auto', keepAnchor: true });
+                scrollTranscriptToPage(pendingTargetPage, { behavior: 'auto' });
+                return;
+            }
+            if (isProgrammaticScroll || pendingTargetPage !== null) {
+                if (isProgrammaticScroll) armProgrammaticScrollRelease();
                 return;
             }
             if (!leftScrollPane.value) return;
@@ -170,7 +218,7 @@ export default {
 
             pageObserver = new IntersectionObserver(
                 (entries) => {
-                    if (isProgrammaticScroll) return;
+                    if (isProgrammaticScroll || pendingTargetPage !== null) return;
                     let updated = false;
                     if (leftScrollPane.value) {
                         const paneRect = leftScrollPane.value.getBoundingClientRect();
@@ -246,12 +294,15 @@ export default {
             const seq = ++activeLoadSeq;
 
             teardownPageObserver();
+            clearPendingTargetPage();
             pages.value = [];
             previewUrl.value = null;
             textContent.value = '';
             isTextTooLarge.value = false;
             transcriptPages.value = [];
-            activePageIndex.value = 0;
+            activePageIndex.value = (typeof props.initialPage === 'number' && props.initialPage >= 0)
+                ? props.initialPage
+                : 0;
             realSummaries.value = [];
             isLoading.value = true;
             error.value = null;
@@ -322,6 +373,9 @@ export default {
                     if (category === 'note' && pages.value.length > 0) {
                         await setupPageObserver();
                     }
+                    if (typeof props.initialPage === 'number' && props.initialPage >= 0) {
+                        await jumpToTargetPage(props.initialPage, { smooth: false });
+                    }
                 }
             }
         };
@@ -373,17 +427,35 @@ export default {
         onMounted(() => {
             window.addEventListener('supernote:digest-sync', handleDigestSync);
             window.addEventListener('supernote:file-sync', handleFileSync);
+            window.addEventListener('wheel', clearPendingTargetPage, { passive: true });
+            window.addEventListener('touchstart', clearPendingTargetPage, { passive: true });
+            window.addEventListener('pointerdown', clearPendingTargetPage, { passive: true });
+            fetchAiStatus().then((status) => {
+                aiStatus.value = status;
+            }).catch(() => {});
             loadFileContent();
         });
         onUnmounted(() => {
             window.removeEventListener('supernote:digest-sync', handleDigestSync);
             window.removeEventListener('supernote:file-sync', handleFileSync);
+            window.removeEventListener('wheel', clearPendingTargetPage);
+            window.removeEventListener('touchstart', clearPendingTargetPage);
+            window.removeEventListener('pointerdown', clearPendingTargetPage);
             teardownPageObserver();
+            clearPendingTargetPage();
             if (programmaticScrollTimer) clearTimeout(programmaticScrollTimer);
         });
         watch(() => props.file?.id, (newId) => {
             if (newId) loadFileContent();
         });
+        watch(
+            () => [props.initialPage, props.pageJumpSeq],
+            ([newPage]) => {
+                if (!isLoading.value && typeof newPage === 'number' && newPage >= 0) {
+                    jumpToTargetPage(newPage, { smooth: true });
+                }
+            }
+        );
         watch(activeRightTab, (tab) => {
             if (tab === 'transcription') {
                 nextTick(() => scrollTranscriptToPage(activePageIndex.value));
@@ -419,6 +491,7 @@ export default {
             scrollToCanvasPage,
             updateActivePageFromScroll,
             realSummaries,
+            aiStatus,
             formatContent
         };
     },
@@ -593,9 +666,14 @@ export default {
                 <!-- Tab 1: Real OCR Transcript -->
                 <div v-if="activeRightTab === 'transcription'" ref="transcriptScrollPane" class="p-4 flex-1 overflow-y-auto space-y-3">
                     <div class="flex items-center justify-between">
-                        <div class="flex items-center gap-2">
-                            <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Gemini Vision OCR</span>
-                            <span v-if="transcriptPages.length > 0" class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-[11px] font-bold text-slate-400 uppercase tracking-wider shrink-0">OCR Transcript</span>
+                            <span v-if="aiStatus?.ocrEnabled && aiStatus?.model"
+                                class="px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950/60 text-[10px] font-mono text-indigo-600 dark:text-indigo-400 truncate"
+                                :title="aiStatus.model">
+                                {{ aiStatus.model }}
+                            </span>
+                            <span v-if="transcriptPages.length > 0" class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-[10px] font-mono text-slate-500 dark:text-slate-400 shrink-0">
                                 {{ transcriptPages.length }} {{ transcriptPages.length === 1 ? 'page' : 'pages' }}
                             </span>
                         </div>
@@ -650,7 +728,12 @@ export default {
                     </div>
 
                     <div v-else class="bg-slate-50 dark:bg-slate-800/50 p-6 rounded-xl border border-slate-200/80 dark:border-slate-800 text-center text-xs text-slate-400">
-                        No OCR transcript found for this notebook yet. Ensure background processor is running or Gemini API key is configured.
+                        <template v-if="aiStatus && !aiStatus.ocrEnabled">
+                            No OCR transcript available. OCR is not enabled on this server.
+                        </template>
+                        <template v-else>
+                            No OCR transcript found for this notebook yet. Background processing may still be running, or the pages contain no handwriting.
+                        </template>
                     </div>
                 </div>
 

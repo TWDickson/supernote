@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -11,7 +13,9 @@ from supernote.client.summary import SummaryClient
 from supernote.models.base import ProcessingStatus
 from supernote.models.extended import PageTranscriptVO
 from supernote.models.summary import AddSummaryDTO
+from supernote.server.ai.models.embedding import EmbeddingTaskType
 from supernote.server.config import AiConfig, ModelConfig, ServerConfig
+from supernote.server.constants import USER_DATA_BUCKET
 from supernote.server.db.models.file import UserFileDO
 from supernote.server.db.models.note_processing import NotePageContentDO, SystemTaskDO
 from supernote.server.db.session import DatabaseSessionManager
@@ -140,6 +144,69 @@ async def test_extended_search_with_mock(
     assert len(resp.results) > 0
     assert resp.results[0].file_id == file_id
     assert "quick brown fox" in resp.results[0].text_preview
+
+
+async def test_extended_search_raw_camelcase_json_contract(
+    client: TestClient,
+    extended_client: ExtendedClient,
+    session_manager: DatabaseSessionManager,
+    test_user_id: int,
+) -> None:
+    """Verify /api/extended/search honors camelCase topN and returns camelCase result keys."""
+    assert client.app is not None
+    query_vec = await client.app["embedding_model"].embed(
+        "deep-dive", EmbeddingTaskType.RETRIEVAL_QUERY
+    )
+    opposite_vec = [-v for v in query_vec]
+
+    file_id = 102
+    async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=file_id,
+                user_id=test_user_id,
+                file_name="Architecture.note",
+                directory_id=0,
+            )
+        )
+        session.add_all(
+            [
+                NotePageContentDO(
+                    file_id=file_id,
+                    page_index=0,
+                    page_id="P20250115100000abc",
+                    text_content="Page one overview.",
+                    embedding=json.dumps(opposite_vec),
+                    embedding_model="fake-embedding-v1",
+                ),
+                NotePageContentDO(
+                    file_id=file_id,
+                    page_index=2,
+                    page_id="P20250116100000def",
+                    text_content="Page three deep-dive.",
+                    embedding=json.dumps(query_vec),
+                    embedding_model="fake-embedding-v1",
+                ),
+            ]
+        )
+        await session.commit()
+
+    raw_resp = await extended_client._client.post(
+        "/api/extended/search",
+        json={"query": "deep-dive", "topN": 1},
+    )
+    assert raw_resp.status == 200
+    payload = await raw_resp.json()
+    assert payload["success"] is True
+    assert len(payload["results"]) == 1
+    hit = payload["results"][0]
+    assert hit["fileId"] == file_id
+    assert hit["fileName"] == "Architecture.note"
+    assert hit["pageIndex"] == 2
+    assert hit["pageId"] == "P20250116100000def"
+    assert hit["textPreview"] == "Page three deep-dive."
+    assert hit["date"] == "2025-01-16"
+    assert isinstance(hit["score"], float)
 
 
 async def test_extended_transcript_not_found(
@@ -453,3 +520,68 @@ async def test_extended_ai_status(extended_client: ExtendedClient) -> None:
         "vectorSearchEnabled": True,
         "model": "fake-ocr-v1",
     }
+
+
+async def test_extended_note_cover_converts_only_first_page(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    session_manager: DatabaseSessionManager,
+    test_user_id: int,
+) -> None:
+    assert client.app is not None
+    blob_storage = client.app["blob_storage"]
+    conversion_service = client.app["conversion_service"]
+    file_id = 9101
+    storage_key = "cover_test_9101.note"
+    multipage_note = Path("tests/testdata/mmujynya/stroller.note")
+
+    await blob_storage.put(USER_DATA_BUCKET, storage_key, multipage_note.read_bytes())
+    async with session_manager.session() as session:
+        session.add(
+            UserFileDO(
+                id=file_id,
+                user_id=test_user_id,
+                directory_id=0,
+                file_name="CoverOnly.note",
+                is_folder="N",
+                storage_key=storage_key,
+                md5="md5_cover_9101",
+            )
+        )
+        await session.commit()
+
+    resp = await client.post(
+        "/api/extended/file/note/cover",
+        json={"fileId": str(file_id)},
+        headers=auth_headers,
+    )
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["success"] is True
+    assert data["url"] is not None
+    assert f"/api/oss/png/{file_id}/0?" in data["url"]
+
+    # Page 1 was NOT eagerly converted
+    assert (
+        await conversion_service.get_note_png_page("test@example.com", file_id, 1)
+        is None
+    )
+
+    # Signed URL downloads valid PNG bytes
+    rel_url = "/" + data["url"].split("/", 3)[3]
+    png_resp = await client.get(rel_url)
+    assert png_resp.status == 200
+    png_bytes = await png_resp.read()
+    assert png_bytes.startswith(b"\x89PNG")
+
+    # When web_notebook_preview is disabled, cover endpoint returns url=None
+    client.app["config"].web_notebook_preview = False
+    disabled_resp = await client.post(
+        "/api/extended/file/note/cover",
+        json={"fileId": str(file_id)},
+        headers=auth_headers,
+    )
+    assert disabled_resp.status == 200
+    disabled_data = await disabled_resp.json()
+    assert disabled_data["success"] is True
+    assert disabled_data["url"] is None

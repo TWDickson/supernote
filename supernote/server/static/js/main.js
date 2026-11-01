@@ -2,8 +2,6 @@ import { createApp, ref, onMounted, computed, watch, nextTick } from 'https://un
 import { useFileSystem } from './composables/useFileSystem.js';
 import { useToast } from './composables/useToast.js';
 import { setToken, getToken, login, logout, fetchProcessingStatus, fetchPathInfo, connectSocket } from './api/client.js';
-import Sidebar from './components/Sidebar.js';
-import DashboardView from './components/DashboardView.js';
 import SearchModal from './components/SearchModal.js';
 import TaskPanel from './components/TaskPanel.js';
 import FileCard from './components/FileCard.js';
@@ -38,6 +36,13 @@ function buildCrumbsFromPathInfo(info) {
     return crumbs;
 }
 
+function parsePageParam(params) {
+    if (!params || !params.has('page')) return null;
+    const rawPage = Number.parseInt(params.get('page'), 10);
+    if (Number.isNaN(rawPage) || rawPage < 1) return 0;
+    return rawPage - 1;
+}
+
 export function parseUrlHash(hashString) {
     const raw = hashString !== undefined ? hashString : (window.location.hash || window.location.search || '');
     const clean = raw.replace(/^[#?]\/?/, '').trim();
@@ -46,9 +51,20 @@ export function parseUrlHash(hashString) {
         return { tab: 'files', view: 'grid', dirId: '0', showSystem: false };
     }
 
-    if (clean.includes('=')) {
-        const queryPart = clean.includes('?') ? clean.split('?')[1] : clean;
-        const params = new URLSearchParams(queryPart);
+    let pathPart = clean;
+    let params = null;
+    const qIdx = clean.indexOf('?');
+    if (qIdx !== -1) {
+        pathPart = clean.slice(0, qIdx);
+        params = new URLSearchParams(clean.slice(qIdx + 1));
+    } else if (clean.includes('=') && !clean.includes('/')) {
+        pathPart = '';
+        params = new URLSearchParams(clean);
+    }
+
+    const pageIndex = parsePageParam(params);
+
+    if (params) {
         if (params.get('tab') === 'system' || params.get('view') === 'system') {
             return { tab: 'system', view: 'grid', dirId: params.get('dir') || '0', showSystem: true };
         }
@@ -61,6 +77,7 @@ export function parseUrlHash(hashString) {
                 view: 'viewer',
                 fileId: params.get('file'),
                 dirId: params.get('dir') || null,
+                pageIndex,
                 showSystem: false
             };
         }
@@ -74,7 +91,7 @@ export function parseUrlHash(hashString) {
         }
     }
 
-    const parts = clean.split('/').filter(Boolean);
+    const parts = pathPart.split('/').filter(Boolean);
 
     if (parts[0] === 'system') {
         return { tab: 'system', view: 'grid', dirId: '0', showSystem: true };
@@ -85,15 +102,15 @@ export function parseUrlHash(hashString) {
     }
 
     if (parts[0] === 'file' && parts[1]) {
-        return { tab: 'files', view: 'viewer', fileId: parts[1], showSystem: false };
+        return { tab: 'files', view: 'viewer', fileId: parts[1], pageIndex, showSystem: false };
     }
 
     if ((parts[0] === 'files' || parts[0] === 'explorer') && parts[1] === 'file' && parts[2]) {
-        return { tab: 'files', view: 'viewer', fileId: parts[2], showSystem: false };
+        return { tab: 'files', view: 'viewer', fileId: parts[2], pageIndex, showSystem: false };
     }
 
     if ((parts[0] === 'files' || parts[0] === 'explorer') && parts[2] === 'file' && parts[3]) {
-        return { tab: 'files', view: 'viewer', dirId: parts[1], fileId: parts[3], showSystem: false };
+        return { tab: 'files', view: 'viewer', dirId: parts[1], fileId: parts[3], pageIndex, showSystem: false };
     }
 
     if ((parts[0] === 'files' || parts[0] === 'explorer' || parts[0] === 'folder') && parts[1]) {
@@ -107,7 +124,7 @@ export function parseUrlHash(hashString) {
     return { tab: 'files', view: 'grid', dirId: '0', showSystem: false };
 }
 
-export function buildUrlHash(tab, dirId, viewState, fileObj, showSystem = false) {
+export function buildUrlHash(tab, dirId, viewState, fileObj, showSystem = false, pageIndex = null) {
     if (showSystem || tab === 'system') {
         return '#/system';
     }
@@ -115,6 +132,9 @@ export function buildUrlHash(tab, dirId, viewState, fileObj, showSystem = false)
         return '#/tasks';
     }
     if (viewState === 'viewer' && fileObj && fileObj.id) {
+        if (typeof pageIndex === 'number' && pageIndex > 0) {
+            return `#/file/${fileObj.id}?page=${pageIndex + 1}`;
+        }
         return `#/file/${fileObj.id}`;
     }
     if (dirId && String(dirId) !== '0') {
@@ -125,8 +145,6 @@ export function buildUrlHash(tab, dirId, viewState, fileObj, showSystem = false)
 
 createApp({
     components: {
-        Sidebar,
-        DashboardView,
         SearchModal,
         TaskPanel,
         FileCard,
@@ -144,23 +162,9 @@ createApp({
         const loginError = ref(null);
         const showSystemPanel = ref(false);
 
-        // Theme Mode
-        const isDarkMode = ref(localStorage.getItem('supernote_theme') === 'dark');
-
-        const toggleTheme = () => {
-            isDarkMode.value = !isDarkMode.value;
-            localStorage.setItem('supernote_theme', isDarkMode.value ? 'dark' : 'light');
-            if (isDarkMode.value) {
-                document.documentElement.classList.add('dark');
-            } else {
-                document.documentElement.classList.remove('dark');
-            }
-        };
-
         // Navigation State
-        const activeTab = ref('files'); // 'files' | 'explorer' | 'tasks' | 'dashboard'
+        const activeTab = ref('files'); // 'files' | 'tasks'
         const showSearchModal = ref(false);
-        const isSidebarOpen = ref(false);
 
         // UI Modals State
         const showNewFolderModal = ref(false);
@@ -188,14 +192,15 @@ createApp({
 
         const view = ref('grid');
         const selectedFile = ref(null);
+        const selectedPageIndex = ref(null);
+        const selectedPageJumpSeq = ref(0);
         const breadcrumbs = ref([{ id: "0", name: "Cloud" }]);
 
         const folders = computed(() => files.value.filter(f => f.isDirectory));
         const regularFiles = computed(() => files.value.filter(f => !f.isDirectory));
-        const recentNotes = computed(() => files.value.filter(f => f.extension === 'note'));
 
         // URL Routing Synchronization
-        const ROUTING_QUERY_KEYS = ['dir', 'folder', 'file', 'tab', 'view'];
+        const ROUTING_QUERY_KEYS = ['dir', 'folder', 'file', 'tab', 'view', 'page'];
         let urlSyncDepth = 0;
         let activeSyncSeq = 0;
         let lastSyncedHash = '';
@@ -239,7 +244,8 @@ createApp({
                 currentDirectoryId.value,
                 view.value,
                 selectedFile.value,
-                showSystemPanel.value
+                showSystemPanel.value,
+                selectedPageIndex.value
             );
             lastSyncedHash = targetHash;
             const stripQuery = hasRoutingQueryParams(window.location.search);
@@ -286,8 +292,8 @@ createApp({
                 if (allCrumbs.length <= 1) {
                     selectedFile.value = {
                         id: targetFileId,
-                        name: `Notebook ${targetFileId}`,
-                        extension: 'note'
+                        name: `File ${targetFileId}`,
+                        extension: ''
                     };
                     view.value = 'viewer';
                     return;
@@ -298,7 +304,7 @@ createApp({
                 const parentDirId = String(folderCrumbs[folderCrumbs.length - 1].id);
                 const ext = fileCrumb.name.includes('.')
                     ? fileCrumb.name.split('.').pop().toLowerCase()
-                    : 'note';
+                    : '';
 
                 breadcrumbs.value = folderCrumbs;
                 currentDirectoryId.value = parentDirId;
@@ -320,8 +326,8 @@ createApp({
                 console.error("Failed to resolve file path info:", e);
                 selectedFile.value = {
                     id: targetFileId,
-                    name: `Notebook ${targetFileId}`,
-                    extension: 'note'
+                    name: `File ${targetFileId}`,
+                    extension: ''
                 };
                 view.value = 'viewer';
             }
@@ -330,6 +336,7 @@ createApp({
         async function restoreDirectoryState(targetDirId, isInitial, seq) {
             view.value = 'grid';
             selectedFile.value = null;
+            selectedPageIndex.value = null;
             selectedIds.value = [];
 
             const dirChanged = String(currentDirectoryId.value) !== targetDirId;
@@ -381,12 +388,17 @@ createApp({
                     activeTab.value = 'tasks';
                     view.value = 'grid';
                     selectedFile.value = null;
+                    selectedPageIndex.value = null;
                     viewerOpenedFromHistory = false;
                     return;
                 }
 
                 activeTab.value = 'files';
                 if (parsed.view === 'viewer' && parsed.fileId) {
+                    selectedPageIndex.value = typeof parsed.pageIndex === 'number' ? parsed.pageIndex : null;
+                    if (typeof parsed.pageIndex === 'number') {
+                        selectedPageJumpSeq.value++;
+                    }
                     await restoreViewerState(String(parsed.fileId), seq);
                     return;
                 }
@@ -399,7 +411,7 @@ createApp({
             }
         }
 
-        watch([activeTab, currentDirectoryId, view, () => selectedFile.value?.id, showSystemPanel], () => {
+        watch([activeTab, currentDirectoryId, view, () => selectedFile.value?.id, selectedPageIndex, showSystemPanel], () => {
             updateUrl();
         });
 
@@ -408,7 +420,7 @@ createApp({
             showSystemPanel.value = false;
             systemOpenedFromHistory = false;
             activeTab.value = tab;
-            if (tab === 'files' || tab === 'explorer' || tab === 'dashboard') {
+            if (tab === 'files') {
                 viewerOpenedFromHistory = false;
                 await restoreDirectoryState(String(currentDirectoryId.value || '0'), false, ++activeSyncSeq);
             }
@@ -431,7 +443,7 @@ createApp({
             await nextTick();
             urlSyncDepth--;
             updateUrl(true);
-            if ((activeTab.value === 'files' || activeTab.value === 'explorer' || activeTab.value === 'dashboard') && view.value === 'grid') {
+            if (activeTab.value === 'files' && view.value === 'grid') {
                 await restoreDirectoryState(String(currentDirectoryId.value || '0'), false, ++activeSyncSeq);
             }
         }
@@ -446,6 +458,7 @@ createApp({
             urlSyncDepth++;
             view.value = 'grid';
             selectedFile.value = null;
+            selectedPageIndex.value = null;
             await nextTick();
             urlSyncDepth--;
             updateUrl(true);
@@ -457,6 +470,7 @@ createApp({
                 activeTab.value = 'files';
                 view.value = 'grid';
                 selectedFile.value = null;
+                selectedPageIndex.value = null;
                 viewerOpenedFromHistory = false;
                 currentDirectoryId.value = String(item.id);
                 const existingIndex = breadcrumbs.value.findIndex(c => String(c.id) === String(item.id));
@@ -468,7 +482,20 @@ createApp({
                 selectedIds.value = [];
                 await loadDirectory(item.id);
             } else {
+                const targetPage = typeof item.pageIndex === 'number' ? item.pageIndex : null;
+                if (
+                    view.value === 'viewer' &&
+                    String(selectedFile.value?.id) === String(item.id)
+                ) {
+                    selectedPageIndex.value = targetPage ?? 0;
+                    selectedPageJumpSeq.value++;
+                    return;
+                }
                 viewerOpenedFromHistory = true;
+                selectedPageIndex.value = targetPage;
+                if (targetPage !== null) {
+                    selectedPageJumpSeq.value++;
+                }
                 selectedFile.value = item;
                 view.value = 'viewer';
             }
@@ -497,6 +524,23 @@ createApp({
             currentDirectoryId.value = String(target.id);
             selectedIds.value = [];
             await loadDirectory(target.id);
+        }
+
+        async function handleSearchSelectFile(item) {
+            if (!item) return;
+            showSystemPanel.value = false;
+            systemOpenedFromHistory = false;
+            if (item.isDirectory) {
+                await navigateFolder(item);
+                return;
+            }
+            activeTab.value = 'files';
+            const existingFile = files.value.find(f => String(f.id) === String(item.id));
+            await openItem(existingFile ? { ...existingFile, pageIndex: item.pageIndex } : item);
+        }
+
+        async function handleSearchSelectTask() {
+            await switchTab('tasks');
         }
 
         // Selection
@@ -610,9 +654,6 @@ createApp({
         }
 
         onMounted(async () => {
-            if (isDarkMode.value) {
-                document.documentElement.classList.add('dark');
-            }
             const loggedIn = await resumeSession();
             if (loggedIn) {
                 await syncFromUrl(true);
@@ -626,9 +667,10 @@ createApp({
                 loadDirectory(currentDirectoryId.value || '0');
             });
 
-            // Keyboard shortcut ⌘K for search
+            // Keyboard shortcut ⌘K / Ctrl+K for search
             window.addEventListener('keydown', (e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+                    if (!isLoggedIn.value) return;
                     e.preventDefault();
                     showSearchModal.value = !showSearchModal.value;
                 }
@@ -660,16 +702,12 @@ createApp({
             isLoggedIn,
             handleLogin,
             handleLogout,
-            isDarkMode,
-            toggleTheme,
             activeTab,
             showSearchModal,
-            isSidebarOpen,
             view,
             files,
             folders,
             regularFiles,
-            recentNotes,
             currentDirectoryId,
             isLoading,
             error,
@@ -682,6 +720,8 @@ createApp({
             navigateFolder,
             navigateTo,
             selectedFile,
+            selectedPageIndex,
+            selectedPageJumpSeq,
             showSystemPanel,
             showNewFolderModal,
             newFolderName,
@@ -702,7 +742,9 @@ createApp({
             processingStatuses,
             toasts,
             showToast,
-            dismissToast
+            dismissToast,
+            handleSearchSelectFile,
+            handleSearchSelectTask
         };
     }
 }).mount('#app');
